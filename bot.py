@@ -1,6 +1,7 @@
 import asyncio
 import random
 import json
+import urllib.request
 from google import genai
 from playwright.async_api import async_playwright
 
@@ -27,6 +28,43 @@ async def get_ad_description(context, url):
         return f"Nie udało się pobrać opisu: {str(e)}"
     finally:
         await page.close()
+
+
+def send_to_discord(webhook_url, text):
+    """Wysyła tekst na Discorda, dzieląc go na części do 2000 znaków"""
+    if webhook_url == "TUTAJ_WSTAW_LINK_WEBHOOKA":
+        print("⚠️ Brak skonfigurowanego Webhooka Discorda. Pomijam wysyłkę.")
+        return
+
+    # Jeśli tekst jest za długi, dzielimy go na bloki (np. po linijkach)
+    chunks = []
+    current_chunk = ""
+
+    for line in text.split("\n"):
+        if len(current_chunk) + len(line) + 1 > 1900:  # Bezpieczny bufor
+            chunks.append(current_chunk)
+            current_chunk = line
+        else:
+            current_chunk = current_chunk + "\n" + line if current_chunk else line
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    # Fizyczna wysyłka każdego kawałka
+    for chunk in chunks:
+        payload = {"content": chunk}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                if response.getcode() in [200, 204]:
+                    print("🚀 Raport pomyślnie wysłany na Discorda!")
+        except Exception as e:
+            print(f"❌ Błąd podczas wysyłania na Discorda: {e}")
 
 
 async def main():
@@ -143,7 +181,7 @@ async def main():
     **Tytuł:** [Tytuł ogłoszenia]
     **Cena:** [Cena]
     **Ocena:** [Twoja ocena w skali 1-10]/10
-    **Uzasadnienie:** [Tylko JEDNO konkretne zdanie uzasadniające ocenę, bazujące na usterce]
+    **Uzasadnienie:** [Tylko JEDNO konkretne zdanie uzasadniające ocenę, bazujące na usterce lub ważnym detalu z opisu]
     **Link:** [Link do ogłoszenia]
     ---
 
@@ -164,6 +202,11 @@ async def main():
             print("\n================ REPORT AI AGENTA ================")
             print(response.text)
             print("==================================================")
+
+            # === WYSYŁKA NA DISCORDA ===
+            DISCORD_WEBHOOK = "TUTAJ_WSTAW_TWÓJ_SKOPIOWANY_LINK_WEBHOOKA"
+            send_to_discord(DISCORD_WEBHOOK, response.text)
+
             sukces = True
             break
 
