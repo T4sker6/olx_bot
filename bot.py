@@ -16,7 +16,6 @@ DB_PATH = Path(__file__).parent / "prices.db"
 
 MAX_ADS_PER_RUN = 35
 MAX_SEEN_PER_CATEGORY = 2000
-FETCH_CONCURRENCY = 4  # ile opisów pobieramy równolegle
 
 KATEGORIE = {
     "gpu": {
@@ -105,20 +104,18 @@ def save_new_ads(kategoria: str, ads: list):
 
 # --- Scraping ---
 
-async def fetch_description(semaphore, context, url):
-    async with semaphore:
-        await asyncio.sleep(random.uniform(0.5, 1.5))
-        try:
-            page = await context.new_page()
-            await page.goto(url, timeout=15000)
-            await page.wait_for_timeout(1500)
-            desc_el = await page.query_selector('div[data-cy="ad_description"]')
-            text = await desc_el.text_content() if desc_el else "Brak opisu w kodzie strony."
-            return text.strip()
-        except Exception as e:
-            return f"Nie udało się pobrać opisu: {e}"
-        finally:
-            await page.close()
+async def fetch_description(context, url):
+    try:
+        page = await context.new_page()
+        await page.goto(url, timeout=15000)
+        await page.wait_for_timeout(1500)
+        desc_el = await page.query_selector('div[data-cy="ad_description"]')
+        text = await desc_el.text_content() if desc_el else "Brak opisu w kodzie strony."
+        return text.strip()
+    except Exception as e:
+        return f"Nie udało się pobrać opisu: {e}"
+    finally:
+        await page.close()
 
 
 # --- Discord ---
@@ -194,7 +191,7 @@ async def main():
 
     async with async_playwright() as p:
         print(f"🌐 [{config['tag']}] Odpalam przeglądarkę Chromium...")
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
@@ -243,12 +240,14 @@ async def main():
             await browser.close()
             return
 
-        # Faza 2: równoległe pobieranie opisów
-        print(f"🔍 Znaleziono {len(new_ads)} nowych ofert. Pobieram opisy (równolegle x{FETCH_CONCURRENCY})...")
-        semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
-        descriptions = await asyncio.gather(*[
-            fetch_description(semaphore, context, ad["link"]) for ad in new_ads
-        ])
+        # Faza 2: sekwencyjne pobieranie opisów
+        print(f"🔍 Znaleziono {len(new_ads)} nowych ofert. Pobieram opisy...")
+        descriptions = []
+        for i, ad in enumerate(new_ads):
+            print(f"   [{i + 1}/{len(new_ads)}] {ad['tytul'][:40]}...")
+            desc = await fetch_description(context, ad["link"])
+            descriptions.append(desc)
+            await asyncio.sleep(random.uniform(1.0, 3.0))
 
         await browser.close()
 
