@@ -2,27 +2,23 @@ import argparse
 import asyncio
 import json
 import random
+import sqlite3
 import urllib.request
+from pathlib import Path
 from google import genai
 from playwright.async_api import async_playwright
 
 # ==========================================
 GEMINI_API_KEY = "TUTAJ_WSTAW_SWOJ_KLUCZ_API"
 DISCORD_WEBHOOK = "TUTAJ_WSTAW_LINK_WEBHOOKA"
+DB_PATH = Path(__file__).parent / "prices.db"
 # ==========================================
 
-# CONFIG MAPA - Tutaj trzymamy specyfikę każdej kategorii
+MAX_ADS_PER_RUN = 35
+MAX_SEEN_PER_CATEGORY = 2000
+FETCH_CONCURRENCY = 4  # ile opisów pobieramy równolegle
+
 KATEGORIE = {
-    "laptopy": {
-        "url": "https://www.olx.pl/elektronika/komputery/laptopy/?search%5Border%5D=created_at:desc",
-        "tag": "LAPTOPY",
-        "specyfika": "Zwróć uwagę na baterię, potencjał wymiany lub rozbudowy SSD a także dodanie RAMu. Odrzuć modele z uszkodzonym ekranem lub obudową, interesują Cię te z potencjałem taniej naprawy i łatwej odsprzedaży",
-    },
-    "komputery": {
-        "url": "https://www.olx.pl/elektronika/komputery/komputery-stacjonarne/?search%5Border%5D=created_at:desc",
-        "tag": "CAŁE PC",
-        "specyfika": "Oceń konfigurację jako całość. Szukaj zestawów które można rozbudować lub tanio naprawić. Odrzucaj takie bez potencjału rozbudowy. Zawsze rozważ także możliwość rozebrania na części, zwłaszcza jeśli cena jest atrakcyjna.",
-    },
     "gpu": {
         "url": "https://www.olx.pl/elektronika/komputery/podzespoly-i-czesci/karty-graficzne/?search%5Border%5D=created_at:desc",
         "tag": "KARTY GRAFICZNE",
@@ -58,62 +54,125 @@ KATEGORIE = {
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-async def get_ad_description(context, url):
-    try:
-        page = await context.new_page()
-        await page.goto(url, timeout=15000)
-        await page.wait_for_timeout(2000)
+# --- DB ---
 
-        desc_el = await page.query_selector('div[data-cy="ad_description"]')
-        if desc_el:
-            text = await desc_el.text_content()
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_olx_table():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS PRICE_TRACKING_OLX (
+                id         INTEGER   PRIMARY KEY AUTOINCREMENT,
+                link       TEXT      UNIQUE NOT NULL,
+                kategoria  TEXT      NOT NULL,
+                tytul      TEXT,
+                cena       TEXT,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+def load_seen_links(kategoria: str) -> set:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT link FROM PRICE_TRACKING_OLX WHERE kategoria = ?", (kategoria,)
+        ).fetchall()
+    return {row["link"] for row in rows}
+
+
+def save_new_ads(kategoria: str, ads: list):
+    with get_connection() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO PRICE_TRACKING_OLX (link, kategoria, tytul, cena) VALUES (?, ?, ?, ?)",
+            [(ad["link"], kategoria, ad["tytul"], ad["cena"]) for ad in ads],
+        )
+        # Rotacja: zostaw tylko ostatnie MAX_SEEN_PER_CATEGORY wpisów dla tej kategorii
+        conn.execute(
+            """DELETE FROM PRICE_TRACKING_OLX
+               WHERE kategoria = ? AND id NOT IN (
+                   SELECT id FROM PRICE_TRACKING_OLX
+                   WHERE kategoria = ?
+                   ORDER BY id DESC
+                   LIMIT ?
+               )""",
+            (kategoria, kategoria, MAX_SEEN_PER_CATEGORY),
+        )
+
+
+# --- Scraping ---
+
+async def fetch_description(semaphore, context, url):
+    async with semaphore:
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        try:
+            page = await context.new_page()
+            await page.goto(url, timeout=15000)
+            await page.wait_for_timeout(1500)
+            desc_el = await page.query_selector('div[data-cy="ad_description"]')
+            text = await desc_el.text_content() if desc_el else "Brak opisu w kodzie strony."
             return text.strip()
-        return "Brak opisu w kodzie strony."
-    except Exception as e:
-        return f"Nie udało się pobrać opisu: {str(e)}"
-    finally:
-        await page.close()
+        except Exception as e:
+            return f"Nie udało się pobrać opisu: {e}"
+        finally:
+            await page.close()
 
 
-def send_to_discord(webhook_url, text):
-    if webhook_url == "TUTAJ_WSTAW_LINK_WEBHOOKA":
-        print("⚠️ Brak skonfigurowanego Webhooka Discorda. Pomijam wysyłkę.")
-        return
+# --- Discord ---
 
-    chunks = []
-    current_chunk = ""
-
-    for line in text.split("\n"):
-        if len(current_chunk) + len(line) + 1 > 1900:
-            chunks.append(current_chunk)
-            current_chunk = line
-        else:
-            current_chunk = current_chunk + "\n" + line if current_chunk else line
-
-    if current_chunk:
-        chunks.append(current_chunk)
+def _send_block(webhook_url, block):
+    """Wysyła jeden blok (jedną ofertę). Jeśli przekracza 1900 znaków, tnie po liniach."""
+    if len(block) <= 1900:
+        chunks = [block]
+    else:
+        chunks, current = [], ""
+        for line in block.split("\n"):
+            if len(current) + len(line) + 1 > 1900:
+                chunks.append(current)
+                current = line
+            else:
+                current = (current + "\n" + line) if current else line
+        if current:
+            chunks.append(current)
 
     for chunk in chunks:
-        payload = {"content": chunk}
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps({"content": chunk}).encode("utf-8")
         req = urllib.request.Request(
             webhook_url,
             data=data,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            },
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
         )
         try:
-            with urllib.request.urlopen(req) as response:
-                if response.getcode() in [200, 204]:
-                    print("🚀 Raport pomyślnie wysłany na Discorda!")
+            with urllib.request.urlopen(req) as resp:
+                if resp.getcode() in [200, 204]:
+                    print("🚀 Oferta wysłana na Discorda!")
         except Exception as e:
             print(f"❌ Błąd podczas wysyłania na Discorda: {e}")
 
 
+def _send_chunks(webhook_url, text):
+    """Parsuje odpowiedź Gemini na bloki (separator ---) i wysyła każdy osobno."""
+    blocks = [b.strip() for b in text.split("---") if b.strip()]
+    if not blocks:
+        print("⚠️ Brak ofert do wysłania (Gemini nie zwrócił żadnych bloków).")
+        return
+    for block in blocks:
+        _send_block(webhook_url, block)
+
+
+async def send_to_discord(webhook_url, text):
+    if webhook_url == "TUTAJ_WSTAW_LINK_WEBHOOKA":
+        print("⚠️ Brak skonfigurowanego Webhooka Discorda. Pomijam wysyłkę.")
+        return
+    await asyncio.to_thread(_send_chunks, webhook_url, text)
+
+
+# --- Main ---
+
 async def main():
-    # OBŁSUGA ARGUMENTÓW STARTOWYCH
     parser = argparse.ArgumentParser(description="OLX Scraper z podziałem na kategorie")
     parser.add_argument(
         "--kategoria",
@@ -124,26 +183,18 @@ async def main():
     args = parser.parse_args()
 
     config = KATEGORIE[args.kategoria]
-    cache_file = (
-        f"seen_links_{args.kategoria}.txt"  # Osobny plik pamięci dla każdej kategorii
-    )
+    kategoria = args.kategoria
 
     if GEMINI_API_KEY == "TUTAJ_WSTAW_SWOJ_KLUCZ_API":
         print("❌ BŁĄD: Brak klucza API!")
         return
 
-    try:
-        with open(cache_file, "r") as f:
-            all_links = f.read().splitlines()
-    except FileNotFoundError:
-        all_links = []
-
-    seen_links = set(all_links)
-    nowe_linki_w_tej_sesji = []
+    init_olx_table()
+    seen_links = load_seen_links(kategoria)
 
     async with async_playwright() as p:
         print(f"🌐 [{config['tag']}] Odpalam przeglądarkę Chromium...")
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
@@ -156,80 +207,74 @@ async def main():
 
         ads = await page.query_selector_all('div[data-cy="l-card"]')
 
-        scraped_data = []
-        organic_count = 0
-
+        # Faza 1: zbierz nowe oferty z listingu (bez opisów)
         print("📦 Zbieram najświeższe oferty...")
+        new_ads = []
+        links_in_session = set()
 
         for ad in ads:
-            if organic_count >= 35:
+            if len(new_ads) >= MAX_ADS_PER_RUN:
                 break
 
             link_el = await ad.query_selector("a")
             link = await link_el.get_attribute("href") if link_el else ""
 
-            if "promoted" in link or not link:
+            if not link or "promoted" in link:
                 continue
-
             if link.startswith("/d/"):
                 link = "https://www.olx.pl" + link
-
-            if link in seen_links:
+            if link in seen_links or link in links_in_session:
                 continue
 
-            organic_count += 1
-
             title_el = await ad.query_selector("h6, h4, h3")
-            title = await title_el.text_content() if title_el else "Brak tytułu"
-            title = title.strip()
+            title = (await title_el.text_content() if title_el else "Brak tytułu").strip()
 
             price_el = await ad.query_selector('p[data-testid="ad-price"]')
-            price = await price_el.text_content() if price_el else "Brak ceny"
+            price = (await price_el.text_content() if price_el else "Brak ceny")
             price = price.replace("\n", " ").replace("złdo", "zł do").strip()
 
-            print(
-                f"   [{organic_count}/35] Nowa oferta! Pobieram opis dla: {title[:30]}..."
-            )
-            description = await get_ad_description(context, link)
+            new_ads.append({"tytul": title, "cena": price, "link": link})
+            links_in_session.add(link)
 
-            scraped_data.append(
-                {
-                    "id": organic_count,
-                    "tytul": title,
-                    "cena": price,
-                    "link": link,
-                    "opis_sprzedawcy": description,
-                }
-            )
+        await page.close()
 
-            nowe_linki_w_tej_sesji.append(link)
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+        if not new_ads:
+            print(f"☕ [{config['tag']}] Brak nowych ogłoszeń. Kończę.")
+            await browser.close()
+            return
+
+        # Faza 2: równoległe pobieranie opisów
+        print(f"🔍 Znaleziono {len(new_ads)} nowych ofert. Pobieram opisy (równolegle x{FETCH_CONCURRENCY})...")
+        semaphore = asyncio.Semaphore(FETCH_CONCURRENCY)
+        descriptions = await asyncio.gather(*[
+            fetch_description(semaphore, context, ad["link"]) for ad in new_ads
+        ])
 
         await browser.close()
 
-    if not scraped_data:
-        print(f"☕ [{config['tag']}] Brak nowych ogłoszeń. Kończę.")
-        return
+    scraped_data = [
+        {**ad, "id": i + 1, "opis_sprzedawcy": desc}
+        for i, (ad, desc) in enumerate(zip(new_ads, descriptions))
+    ]
 
-    if nowe_linki_w_tej_sesji:
-        all_links.extend(nowe_linki_w_tej_sesji)
-        all_links = all_links[-2000:]
-        with open(cache_file, "w") as f:
-            f.write("\n".join(all_links) + "\n")
+    save_new_ads(kategoria, scraped_data)
 
     json_payload = json.dumps(scraped_data, ensure_ascii=False, indent=2)
 
-    # DYNAMICZNY PROMPT - Wstrzykuje specyfikę wybranej kategorii
     prompt = f"""
     Jesteś ekspertem od wyceny, rynku wtórnego i naprawy sprzętu komputerowego.
     Analizujesz przedmioty z kategorii: {config['tag']}.
-    
-    Twoje wytyczne dla tej kategorii: {config['specyfika']}
-    
-    Oceń opłacalność zakupu poniższych urządzeń pod kątem dalszej odsprzedaży z zyskiem lub rozbudowy własnego homelabu.
-    Odrzuć oferty bez potencjału lub skrajnie przewartościowane.
 
-    WYMÓG KRYTYCZNY: Zwróć wynik STRICTE w poniższym formacie dla każdego zatwierdzonego ogłoszenia. Nie dodawaj ŻADNEGO tekstu przed ani po. Trzymaj się dokładnie tego wzoru:
+    Twoje wytyczne dla tej kategorii: {config['specyfika']}
+
+    Oceń opłacalność zakupu poniższych urządzeń pod kątem dalszej odsprzedaży z zyskiem lub rozbudowy własnego homelabu.
+
+    SKALA OCEN — trzymaj się jej ściśle:
+    9-10: Cena znacznie poniżej rynku LUB usterka tania i oczywista do naprawy; wysoki potencjał zysku
+    7-8:  Cena lekko poniżej rynku, sensowny potencjał naprawy lub odsprzedaży
+    <7:   Brak potencjału — CAŁKOWICIE POMIŃ, nie uwzględniaj w odpowiedzi
+
+    WYMÓG KRYTYCZNY: Raportuj WYŁĄCZNIE oferty z oceną 7/10 lub wyższą. Jeśli żadna oferta nie spełnia progu — zwróć pustą odpowiedź. Nie dodawaj ŻADNEGO tekstu przed ani po blokach. Trzymaj się dokładnie tego wzoru:
 
     # 🔥 [{config['tag']}] NOWA OKAZJA!
     **Tytuł:** [Tytuł ogłoszenia]
@@ -252,10 +297,7 @@ async def main():
         try:
             print(f"   ➤ Pukam do serwera: {model_name}...")
             response = client.models.generate_content(model=model_name, contents=prompt)
-
-            # WYSYŁKA NA DISCORDA
-            send_to_discord(DISCORD_WEBHOOK, response.text)
-
+            await send_to_discord(DISCORD_WEBHOOK, response.text)
             sukces = True
             break
         except Exception as e:
